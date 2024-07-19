@@ -1,0 +1,141 @@
+#renew the certificates for all linux servers under a domain that use the same SSL certificate:
+
+#Ensure that all servers have certbot installed and configured
+
+#Centralize renewal script to manage the renewal process and distribute the renewed certificate to all relevant servers.
+
+#Automate distribution of renewed certificate: once the certificate is renewed on one server, copy the renewed certificate to the other servers.
+
+#Reload web Server configurations: After copying the renewed certificate to the other servers, ensure the web server configurations are reloaded to apply the new certificate.
+
+#Central Server: This server will handle the certificate renewal and distribution process.
+
+#certbot Renewal: uses certbot to renew the certificate on the central server.
+
+#SSH and SFTP: The script connects to other servers using ssh and sftp to distribute the renewed certificate.
+
+#Reload web server: after copying the new certificate, the script reloads the web server configuration on the target servers.
+
+#Important:
+#ssh key authentication: we need to set up ssh key-based authentication between the central server and other servers.
+#correct paths: we need to ensure the certificate and key paths in the script match the actual paths on the servers.
+#Web server reload command: adjust the command to reload the web server configuration according to the web server (apache, nginx) running on the servers.
+
+
+
+
+#Central script to renew and distribute certificates
+
+import socket
+import ssl
+from datetime import datetime, timedelta
+import subprocess
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import os
+import paramiko
+
+# Configuration
+HOSTNAME = 'testserver.domain.com'  # test server's domain or IP
+PORT = 443  # port https
+ALERT_DAYS = 30  # days before expiry to send alert
+
+SMTP_SERVER = 'smtp.domainexample.org'  # smtp server
+SMTP_PORT = 25  # port for the smtp server
+
+SENDER_EMAIL = 'noreply-yoursmtp@domain.com'  # sender email
+RECIPIENT_EMAIL = 'recipient@email.com'  # recipient email
+
+RENEW_COMMAND = 'certbot renew --quiet --no-self-upgrade'  # let's encrypt renewal
+
+# List of servers to distribute the renewed certificate to
+SERVERS = [
+    {'host': 'server1.domain.com', 'username': 'user', 'key_path': '/path_to_private_key'},
+    {'host': 'server2.domain.com', 'username': 'user', 'key_path': '/path_to_private_key'},
+    # Add more servers as needed
+]
+
+# Paths to the certificate files
+CERT_PATH = '/etc/letsencrypt/live/{domain}/fullchain.pem'  # replace {domain} 
+KEY_PATH = '/etc/letsencrypt/live/{domain}/privkey.pem'  # replace {domain}
+
+# Get certificate expiry date
+def get_certificate_expiry_date(hostname, port):
+    print(f"Connecting to {hostname} on port {port} to get the certificate expiry date.")
+    context = ssl.create_default_context()
+    with socket.create_connection((hostname, port)) as sock:
+        with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+            cert = ssock.getpeercert()
+            expiry_date = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+    print(f"Certificate expiry date for {hostname}: {expiry_date}")
+    return expiry_date
+
+# Send email alert using the specified SMTP server
+def send_email_alert(expiry_date):
+    print(f"Preparing to send an email alert to {RECIPIENT_EMAIL}.")
+    msg = MIMEMultipart()
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECIPIENT_EMAIL
+    msg['Subject'] = 'TLS/SSL Certificate Expiry Alert'
+    body = f'The TLS/SSL certificate for {HOSTNAME} will expire on {expiry_date}. Please renew it soon.'
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.send_message(msg)
+        print(f"Email sent to {RECIPIENT_EMAIL}")
+    except Exception as e:
+        print(f"Error sending email: {e}")
+
+# Renew the certificate using let's encrypt
+def renew_certificate():
+    print("Running the certificate renewal command.")
+    try:
+        result = subprocess.run(RENEW_COMMAND, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(result.stdout.decode('utf-8'))
+        print("Certificate renewed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error renewing certificate: {e.stderr.decode('utf-8')}")
+
+# distribute the renewed certificate to other servers
+def distribute_certificate(servers, cert_path, key_path):
+    for server in servers:
+        print(f"Connecting to {server['host']} to distribute the renewed certificate.")
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(server['host'], username=server['username'], key_filename=server['key_path'])
+            
+            sftp = ssh.open_sftp()
+            sftp.put(cert_path, cert_path)
+            sftp.put(key_path, key_path)
+            sftp.close()
+            
+            # reload web server configuration (Apache or Nginx)
+            ssh.exec_command('sudo systemctl reload apache2')  # adjust as necessary
+            ssh.close()
+            
+            print(f"Certificate distributed and server reloaded: {server['host']}")
+        except Exception as e:
+            print(f"Error distributing certificate to {server['host']}: {e}")
+
+def main():
+    print("Starting the certificate check process.")
+    expiry_date = get_certificate_expiry_date(HOSTNAME, PORT)
+    days_to_expiry = (expiry_date - datetime.utcnow()).days
+    print(f"Days to expiry: {days_to_expiry}")
+
+    if days_to_expiry <= ALERT_DAYS:  # Renew if within 30 days to expiry
+        print(f"Certificate is expiring in {days_to_expiry} days. Sending alert and renewing certificate.")
+        send_email_alert(expiry_date)
+        renew_certificate()
+        distribute_certificate(SERVERS, CERT_PATH.format(domain=HOSTNAME), KEY_PATH.format(domain=HOSTNAME))
+        print(f'Alert sent, certificate renewed, and distributed! Certificate expires in {days_to_expiry} days.')
+    else:
+        print(f'Certificate is valid for another {days_to_expiry} days.')
+
+if __name__ == '__main__':
+    main()
+
+
